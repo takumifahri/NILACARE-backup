@@ -1,0 +1,6 @@
+.venv
+__pycache__
+*.pyc
+.env
+backend_stdout.log
+backend_stderr.log

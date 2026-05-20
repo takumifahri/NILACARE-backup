@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+numpy
+pillow
+python-multipart
+# TF 2.16+ ships Keras 3.x which supports quantization_config in Dense layers.
+# Without this pin the container may pull an older TF that cannot load the model.
+tensorflow>=2.16.0
