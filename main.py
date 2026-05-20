@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import logging
 from io import BytesIO
 from pathlib import Path
 from typing import Annotated, Any
@@ -22,6 +23,7 @@ except ModuleNotFoundError:
 
 ALLOWED_MIME_TYPES = {"image/jpeg", "image/png", "image/webp"}
 INPUT_SIZE = (224, 224)
+logger = logging.getLogger("uvicorn.error")
 
 # ── Model Path Resolution ──────────────────────────────────────────────────
 # Priority:
@@ -180,6 +182,7 @@ async def predict(file: Annotated[UploadFile, File(...)]) -> dict[str, Any]:
         image_bytes = await file.read()
         input_tensor = _preprocess_image(image_bytes)
     except Exception:
+        logger.exception("Gagal membaca atau preprocess file gambar.")
         raise HTTPException(status_code=400, detail="File gambar tidak valid.")
 
     try:
@@ -220,4 +223,5 @@ async def predict(file: Annotated[UploadFile, File(...)]) -> dict[str, Any]:
     except HTTPException:
         raise
     except Exception:
+        logger.exception("Gagal melakukan inferensi model.")
         raise HTTPException(status_code=500, detail="Gagal melakukan inferensi model.")
