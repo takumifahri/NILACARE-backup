@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import logging
+import time
+import uuid
 from io import BytesIO
 from pathlib import Path
 from typing import Annotated, Any
@@ -25,6 +27,12 @@ except ModuleNotFoundError:
 ALLOWED_MIME_TYPES = {"image/jpeg", "image/png", "image/webp"}
 INPUT_SIZE = (224, 224)
 logger = logging.getLogger("uvicorn.error")
+VERBOSE_ERRORS = os.getenv("VERBOSE_ERRORS", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 # ── Model Path Resolution ──────────────────────────────────────────────────
 # Priority:
@@ -127,7 +135,65 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Request-ID"],
 )
+
+
+@app.middleware("http")
+async def request_logging_middleware(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex[:12]
+    request.state.request_id = request_id
+    start = time.perf_counter()
+
+    try:
+        response = await call_next(request)
+    except Exception:
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        logger.exception(
+            "request_id=%s method=%s path=%s failed elapsed_ms=%.2f",
+            request_id,
+            request.method,
+            request.url.path,
+            elapsed_ms,
+        )
+        raise
+
+    elapsed_ms = (time.perf_counter() - start) * 1000
+    response.headers["X-Request-ID"] = request_id
+    logger.info(
+        "request_id=%s method=%s path=%s status=%s elapsed_ms=%.2f",
+        request_id,
+        request.method,
+        request.url.path,
+        response.status_code,
+        elapsed_ms,
+    )
+    return response
+
+
+@app.exception_handler(HTTPException)
+async def structured_http_exception_handler(
+    request: Request,
+    exc: HTTPException,
+) -> JSONResponse:
+    request_id = getattr(request.state, "request_id", uuid.uuid4().hex[:12])
+    error_code = "HTTP_ERROR"
+    detail = exc.detail
+
+    if isinstance(exc.detail, dict):
+        detail = exc.detail.get("message", exc.detail.get("detail", "Request gagal."))
+        error_code = str(exc.detail.get("error_code", error_code))
+        request_id = str(exc.detail.get("request_id", request_id))
+
+    return JSONResponse(
+        status_code=exc.status_code,
+        headers={"X-Request-ID": request_id, **(exc.headers or {})},
+        content={
+            "detail": detail,
+            "error_code": error_code,
+            "request_id": request_id,
+        },
+    )
 
 
 @app.exception_handler(Exception)
@@ -135,10 +201,25 @@ async def unhandled_exception_handler(
     request: Request,
     exc: Exception,
 ) -> JSONResponse:
-    logger.exception("Unhandled backend error on %s %s", request.method, request.url.path)
+    request_id = getattr(request.state, "request_id", uuid.uuid4().hex[:12])
+    logger.exception(
+        "request_id=%s unhandled backend error on %s %s",
+        request_id,
+        request.method,
+        request.url.path,
+    )
+    detail = "Terjadi error internal di backend inference."
+    if VERBOSE_ERRORS:
+        detail = f"{detail} ({type(exc).__name__}: {exc})"
+
     return JSONResponse(
         status_code=500,
-        content={"detail": "Terjadi error internal di backend inference."},
+        headers={"X-Request-ID": request_id},
+        content={
+            "detail": detail,
+            "error_code": "INTERNAL_SERVER_ERROR",
+            "request_id": request_id,
+        },
     )
 
 
@@ -184,44 +265,117 @@ def health() -> dict[str, str]:
         500: {"description": "Internal Server Error"},
     },
 )
-async def predict(file: Annotated[UploadFile, File(...)]) -> dict[str, Any]:
+async def predict(
+    request: Request,
+    file: Annotated[UploadFile, File(...)],
+) -> dict[str, Any]:
+    request_id = getattr(request.state, "request_id", uuid.uuid4().hex[:12])
+    filename = file.filename or "(tanpa nama)"
+    logger.info(
+        "request_id=%s predict_start filename=%r content_type=%r",
+        request_id,
+        filename,
+        file.content_type,
+    )
+
     if file.content_type not in ALLOWED_MIME_TYPES:
+        logger.warning(
+            "request_id=%s unsupported_mime filename=%r content_type=%r allowed=%s",
+            request_id,
+            filename,
+            file.content_type,
+            sorted(ALLOWED_MIME_TYPES),
+        )
         raise HTTPException(
             status_code=400,
-            detail="Format file tidak didukung. Gunakan JPEG, PNG, atau WEBP.",
+            detail={
+                "message": "Format file tidak didukung. Gunakan JPEG, PNG, atau WEBP.",
+                "error_code": "UNSUPPORTED_IMAGE_TYPE",
+                "request_id": request_id,
+            },
         )
 
     try:
         image_bytes = await file.read()
+        logger.info(
+            "request_id=%s upload_read filename=%r size_bytes=%s",
+            request_id,
+            filename,
+            len(image_bytes),
+        )
         input_tensor = _preprocess_image(image_bytes)
+        logger.info(
+            "request_id=%s preprocess_ok tensor_shape=%s tensor_dtype=%s",
+            request_id,
+            tuple(input_tensor.shape),
+            input_tensor.dtype,
+        )
     except Exception:
-        logger.exception("Gagal membaca atau preprocess file gambar.")
-        raise HTTPException(status_code=400, detail="File gambar tidak valid.")
+        logger.exception(
+            "request_id=%s preprocess_failed filename=%r content_type=%r",
+            request_id,
+            filename,
+            file.content_type,
+        )
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "File gambar tidak valid.",
+                "error_code": "INVALID_IMAGE_FILE",
+                "request_id": request_id,
+            },
+        )
 
     try:
+        inference_start = time.perf_counter()
         raw_output = MODEL.predict(input_tensor, verbose=0)
+        inference_ms = (time.perf_counter() - inference_start) * 1000
         scores = np.asarray(raw_output, dtype=np.float32)
+        logger.info(
+            "request_id=%s inference_ok raw_shape=%s scores_shape=%s inference_ms=%.2f",
+            request_id,
+            np.shape(raw_output),
+            tuple(scores.shape),
+            inference_ms,
+        )
 
         if scores.ndim == 2 and scores.shape[0] == 1:
             scores = scores[0]
 
         if scores.ndim != 1:
-            raise ValueError("Bentuk output model tidak didukung.")
+            raise ValueError(f"Bentuk output model tidak didukung: shape={scores.shape}")
 
         # Runtime guard: model output neurons must equal label count
         if scores.shape[0] != len(LABELS):
+            logger.error(
+                "request_id=%s output_label_mismatch output_size=%s label_count=%s",
+                request_id,
+                scores.shape[0],
+                len(LABELS),
+            )
             raise HTTPException(
                 status_code=500,
-                detail=(
-                    f"Mismatch: model output size={scores.shape[0]} "
-                    f"!= len(LABELS)={len(LABELS)}."
-                ),
+                detail={
+                    "message": (
+                        f"Mismatch: model output size={scores.shape[0]} "
+                        f"!= len(LABELS)={len(LABELS)}."
+                    ),
+                    "error_code": "MODEL_LABEL_MISMATCH",
+                    "request_id": request_id,
+                },
             )
 
         probabilities = scores if _looks_like_probabilities(scores) else _softmax(scores)
 
         top_index = int(np.argmax(probabilities))
         confidence = float(probabilities[top_index])
+        top_candidates = [
+            {
+                "label": LABELS[int(index)],
+                "confidence": round(float(probabilities[int(index)]), 6),
+            }
+            for index in np.argsort(probabilities)[::-1][: min(3, len(LABELS))]
+        ]
 
         CONFIDENCE_THRESHOLD = 0.45
         if confidence < CONFIDENCE_THRESHOLD:
@@ -229,12 +383,37 @@ async def predict(file: Annotated[UploadFile, File(...)]) -> dict[str, Any]:
         else:
             label = LABELS[top_index]  # always one of the 5 valid classes
 
+        logger.info(
+            "request_id=%s predict_success label=%r confidence=%.6f top_index=%s top_candidates=%s",
+            request_id,
+            label,
+            confidence,
+            top_index,
+            top_candidates,
+        )
+
         return {
             "label": label,
             "confidence": confidence,
+            "request_id": request_id,
         }
     except HTTPException:
         raise
-    except Exception:
-        logger.exception("Gagal melakukan inferensi model.")
-        raise HTTPException(status_code=500, detail="Gagal melakukan inferensi model.")
+    except Exception as exc:
+        logger.exception(
+            "request_id=%s inference_failed filename=%r",
+            request_id,
+            filename,
+        )
+        detail = "Gagal melakukan inferensi model."
+        if VERBOSE_ERRORS:
+            detail = f"{detail} ({type(exc).__name__}: {exc})"
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "message": detail,
+                "error_code": "MODEL_INFERENCE_FAILED",
+                "request_id": request_id,
+            },
+        )

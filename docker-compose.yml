@@ -6,4 +6,5 @@ services:
       - "8091:8091"
     environment:
       CORS_ORIGINS: "https://nila-care-ai.vercel.app,https://nilacareai.takumifahri.my.id,http://localhost:3000,http://127.0.0.1:3000"
+      VERBOSE_ERRORS: "true"
     restart: unless-stopped
